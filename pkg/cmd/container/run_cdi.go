@@ -18,29 +18,119 @@ package container
 
 import (
 	"context"
+	"fmt"
 
 	"tags.cncf.io/container-device-interface/pkg/cdi"
 
 	"github.com/containerd/containerd/v2/core/containers"
 	cdispec "github.com/containerd/containerd/v2/pkg/cdi"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/log"
 )
 
+// detectGPUVendorFromCDI detects the first available GPU vendor from CDI cache.
+// Returns empty string if no known vendor is found.
+func detectGPUVendorFromCDI() string {
+	cache := cdi.GetDefaultCache()
+	availableVendors := cache.ListVendors()
+	knownGPUVendors := []string{"nvidia.com", "amd.com"}
+	for _, known := range knownGPUVendors {
+		for _, available := range availableVendors {
+			if known == available {
+				return known
+			}
+		}
+	}
+
+	return ""
+}
+
+func parseGPUOpts(value []string) ([]string, error) {
+	if len(value) == 0 {
+		return nil, nil
+	}
+
+	vendor := detectGPUVendorFromCDI()
+	if vendor == "" {
+		return nil, fmt.Errorf("no known GPU vendor found in CDI specs")
+	}
+
+	gpuCDIDevices := []string{}
+	for _, gpu := range value {
+		req, err := ParseGPUOptCSV(gpu)
+		if err != nil {
+			return nil, err
+		}
+		gpuCDIDevices = append(gpuCDIDevices, req.toCDIDeviceIDs(vendor)...)
+	}
+	return gpuCDIDevices, nil
+}
+
+func (req *GPUReq) toCDIDeviceIDs(vendor string) []string {
+	var cdiDeviceIDs []string
+	for _, id := range req.normalizeDeviceIDs() {
+		cdiDeviceIDs = append(cdiDeviceIDs, vendor+"/gpu="+id)
+	}
+	return cdiDeviceIDs
+}
+
+func (req *GPUReq) normalizeDeviceIDs() []string {
+	if len(req.DeviceIDs) > 0 {
+		return req.DeviceIDs
+	}
+	if req.Count < 0 {
+		return []string{"all"}
+	}
+	var ids []string
+	for i := 0; i < req.Count; i++ {
+		ids = append(ids, fmt.Sprintf("%d", i))
+	}
+
+	return ids
+}
+
+// withStaticCDIRegistry inits the CDI registry with given spec dirs
+// and disables auto-refresh.
+func withStaticCDIRegistry(cdiSpecDirs []string) oci.SpecOpts {
+	return func(ctx context.Context, _ oci.Client, _ *containers.Container, _ *oci.Spec) error {
+		_ = cdi.Configure(
+			cdi.WithSpecDirs(cdiSpecDirs...),
+			cdi.WithAutoRefresh(false),
+		)
+		if err := cdi.Refresh(); err != nil {
+			// We don't consider registry refresh failure a fatal error.
+			// For instance, a dynamically generated invalid CDI Spec file for
+			// any particular vendor shouldn't prevent injection of devices of
+			// different vendors. CDI itself knows better and it will fail the
+			// injection if necessary.
+			log.L.Warnf("CDI cache refresh failed: %v", err)
+		}
+		return nil
+	}
+}
+
 // withCDIDevices creates the OCI runtime spec options for injecting CDI devices.
-// Two options are returned: The first ensures that the CDI registry is initialized with
-// refresh disabled, and the second injects the devices into the container.
-func withCDIDevices(cdiSpecDirs []string, devices ...string) oci.SpecOpts {
+func withCDIDevices(devices ...string) oci.SpecOpts {
 	return func(ctx context.Context, client oci.Client, c *containers.Container, s *oci.Spec) error {
 		if len(devices) == 0 {
 			return nil
 		}
-
-		// We configure the CDI registry with the configured spec dirs and disable refresh.
-		cdi.Configure(
-			cdi.WithSpecDirs(cdiSpecDirs...),
-			cdi.WithAutoRefresh(false),
-		)
-
 		return cdispec.WithCDIDevices(devices...)(ctx, client, c, s)
+	}
+}
+
+// withGPUs creates the OCI runtime spec options for injecting GPUs via CDI.
+// It parses the given GPU options and converts them to CDI device IDs.
+// withCDIDevices is then used to perform the actual injection.
+func withGPUs(gpuOpts ...string) oci.SpecOpts {
+	return func(ctx context.Context, client oci.Client, c *containers.Container, s *oci.Spec) error {
+		if len(gpuOpts) == 0 {
+			return nil
+		}
+		cdiDevices, err := parseGPUOpts(gpuOpts)
+		if err != nil {
+			return err
+		}
+		return withCDIDevices(cdiDevices...)(ctx, client, c, s)
 	}
 }
